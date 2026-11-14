@@ -607,6 +607,207 @@ def _safe_unlink(path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Point-in-time restore
+# ---------------------------------------------------------------------------
+
+
+def restore_table(
+    table: Path,
+    target_version: int,
+    expected_current_version: int,
+    *,
+    fault_inject: str | None = None,
+) -> dict[str, Any]:
+    """Restore the latest snapshot to the state of *target_version*.
+
+    The whole active file set of the target snapshot is rewritten to **brand
+    new, never-before-used parquet paths** (no target file path is reused) and
+    swapped in with a single ``dataChange=true`` commit containing one add per
+    new file and one remove per currently active file.  Old log versions and
+    physical files are never touched, so every pre-restore snapshot stays
+    readable via time travel.
+
+    Concurrency: restore is an all-or-nothing, non-retried transaction.  The
+    caller must state the version it believes to be current; if any other
+    replica or external writer has committed an append, delete or compaction
+    in the meantime (the latest version no longer matches
+    *expected_current_version*, or another writer wins the next log version),
+    a :class:`ConflictError` is raised and the table is left untouched.
+
+    Failure isolation: target data files are verified to exist and be readable
+    before anything is written; new parquet files are staged and hard-linked
+    into place atomically.  Any failure before the log is published removes
+    the new files again, so no half-finished output is ever queryable.
+    """
+    table = Path(table)
+    versions = list_versions(table)  # TableNotFoundError / corruption surface here
+
+    if target_version not in versions:
+        raise VersionNotFoundError(f"target version {target_version} does not exist")
+    if expected_current_version not in versions:
+        raise VersionNotFoundError(
+            f"expected current version {expected_current_version} does not exist"
+        )
+    if target_version > expected_current_version:
+        raise InvalidRequestError(
+            f"target version {target_version} is newer than the confirmed "
+            f"current version {expected_current_version}"
+        )
+    if expected_current_version != versions[-1]:
+        raise ConflictError(
+            f"table has advanced to version {versions[-1]}; restore was "
+            f"confirmed against version {expected_current_version} and is refused"
+        )
+
+    target_snapshot = load_snapshot(table, target_version)
+    current_snapshot = load_snapshot(table, expected_current_version)
+
+    # Pre-flight: every target data file must exist and be readable before we
+    # write a single byte of restore output. A missing target file aborts with
+    # the table completely unchanged.
+    target_paths = sorted(target_snapshot.active)
+    target_tables: list[pa.Table] = []
+    target_bytes = 0
+    for rel in target_paths:
+        abs_path = _relative_data_path(table, rel)
+        if not abs_path.is_file():
+            raise TableCorruptError(
+                f"target data file is missing on disk: {rel}"
+            )
+        try:
+            part = pq.read_table(abs_path)
+        except FileNotFoundError as exc:
+            raise TableCorruptError(
+                f"target data file is missing on disk: {rel}"
+            ) from exc
+        except (pa.ArrowInvalid, OSError) as exc:
+            raise InvalidRequestError(
+                f"cannot read target parquet {rel}: {exc}"
+            ) from exc
+        if part.schema != TABLE_SCHEMA:
+            raise InvalidRequestError(
+                f"schema of target file {rel} does not match the table schema"
+            )
+        target_tables.append(part)
+        target_bytes += abs_path.stat().st_size
+
+    # Materialise the target rows into one new parquet file under a fresh
+    # unique path. concat preserves every row including exact duplicates and
+    # the target column order/schema; no dedup or filtering ever happens.
+    restored = (
+        pa.concat_tables(target_tables, promote_options="none")
+        if target_tables
+        else TABLE_SCHEMA.empty_table()
+    )
+    _validate_schema(restored)
+    total_rows = restored.num_rows
+
+    staging_name = f"restore-{uuid.uuid4().hex}.parquet"
+    final_rel = _new_data_filename()
+    try:
+        final_rel, output_size = _write_parquet_atomic(
+            table,
+            restored,
+            staging_name=staging_name,
+            final_rel_path=final_rel,
+        )
+    except OSError as exc:
+        (table / STAGING_DIR / staging_name).unlink(missing_ok=True)
+        raise DeltaError(f"failed to write restore parquet: {exc}") from exc
+
+    if fault_inject == "after_data_write":
+        # Test hook: the new data file exists but no commit has happened.
+        # Simulates failure between the data write and log publish; the
+        # rollback below guarantees no half product survives at a data path.
+        _safe_unlink(table / final_rel)
+        raise RuntimeError("fault injection: killed after restore data file write")
+
+    # Final OCC gate: re-read the latest snapshot under the version the
+    # operator confirmed. No retry - any intervening append/delete/compaction
+    # must reject the restore rather than overwrite fresh observations.
+    latest_version = list_versions(table)[-1]
+    if latest_version != expected_current_version:
+        _safe_unlink(table / final_rel)
+        raise ConflictError(
+            f"concurrent commit advanced the table to version {latest_version}; "
+            "restore refused to avoid overwriting new observations"
+        )
+
+    now = _utc_now_ms()
+    add_action = {
+        "add": {
+            "path": final_rel,
+            "size": output_size,
+            "modificationTime": now,
+            "dataChange": True,
+            "stats": json.dumps(
+                {"numRecords": total_rows}, separators=(",", ":")
+            ),
+            "tags": {"restore": "true"},
+        }
+    }
+    remove_actions = [
+        {
+            "remove": {
+                "path": rel,
+                "deletionTimestamp": now,
+                "dataChange": True,
+                "size": current_snapshot.active[rel].size_bytes,
+            }
+        }
+        for rel in sorted(current_snapshot.active)
+    ]
+    commit_info = {
+        "commitInfo": {
+            "timestamp": now,
+            "operation": "RESTORE",
+            "operationParameters": {
+                "targetVersion": target_version,
+                "confirmedCurrentVersion": expected_current_version,
+            },
+            "readVersion": expected_current_version,
+            "isBlindAppend": False,
+            "engineInfo": "delta-compaction-api/1.0",
+            "clientVersion": "delta-compaction-api/1.0",
+            "metrics": {
+                "numRemovedFiles": len(remove_actions),
+                "numAddedFiles": 1,
+                "numRestoredRows": total_rows,
+                "targetVersion": target_version,
+            },
+        }
+    }
+    actions = [commit_info, add_action, *remove_actions]
+
+    try:
+        committed_version = _commit_actions(
+            table,
+            base_version=expected_current_version,
+            actions=actions,
+        )
+    except ConflictError:
+        # Another process claimed the next log version first. Roll the new
+        # data file back; the committed table must remain exactly as it was.
+        _safe_unlink(table / final_rel)
+        raise ConflictError(
+            "concurrent commit won the next log version; restore refused to "
+            "avoid overwriting new observations"
+        )
+
+    return {
+        "version": committed_version,
+        "target_version": target_version,
+        "confirmed_current_version": expected_current_version,
+        "added_files": 1,
+        "removed_files": len(remove_actions),
+        "output_file": final_rel,
+        "rows": total_rows,
+        "target_bytes": target_bytes,
+        "output_bytes": output_size,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Read helpers
 # ---------------------------------------------------------------------------
 

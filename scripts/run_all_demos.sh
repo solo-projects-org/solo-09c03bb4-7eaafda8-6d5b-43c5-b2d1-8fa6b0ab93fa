@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run all three demos against the two local API processes.
+# Run all four demos against the two local API processes.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -13,6 +13,7 @@ export TABLE_DIR="${TABLE_DIR:-$(pwd)/_demo_data/water_level}"
 $PY scripts/demo_readback.py
 $PY scripts/demo_concurrent_append.py
 $PY scripts/demo_concurrent_delete.py
+$PY scripts/demo_restore.py
 
 echo
 echo "All demos completed successfully."

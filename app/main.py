@@ -57,6 +57,33 @@ class CompactResponse(BaseModel):
     attempts: int
 
 
+class RestoreRequest(BaseModel):
+    target_version: int = Field(
+        ...,
+        ge=0,
+        description="Old version whose rows and schema the table must be restored to.",
+    )
+    current_version: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "Latest version the operator confirmed before requesting the "
+            "restore. The restore is refused (409) if the table has advanced."
+        ),
+    )
+
+
+class RestoreResponse(BaseModel):
+    table: str
+    committed_version: int
+    target_version: int
+    confirmed_current_version: int
+    files_added: int
+    files_removed: int
+    output_file: str
+    rows: int
+
+
 class SnapshotResponse(BaseModel):
     table: str
     version: int
@@ -100,7 +127,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Delta Lake Compaction API",
+    title="Delta Lake Compaction & Restore API",
     description=(
         "Compact small parquet files of the unpartitioned water-level "
         "observation Delta table (reader protocol v1, writer protocol v2, "
@@ -108,7 +135,11 @@ app = FastAPI(
         "with dataChange=false and preserve every value, duplicate row, "
         "the schema and all old snapshots. Optimistic concurrency control "
         "lets external writers keep committing; the compaction only "
-        "replaces its selected files while all of them are still active."
+        "replaces its selected files while all of them are still active. "
+        "POST /restore rewrites an older snapshot into brand new parquet "
+        "paths and swaps the active file set with one dataChange=true "
+        "commit; a restore confirmed against a stale current version is "
+        "rejected with 409 so concurrent observations are never overwritten."
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -163,6 +194,40 @@ def compact(req: CompactRequest) -> CompactResponse:
         input_bytes=result["input_bytes"],
         output_bytes=result["output_bytes"],
         attempts=result["attempts"],
+    )
+
+
+@app.post("/restore", response_model=RestoreResponse, tags=["restore"])
+def restore(req: RestoreRequest) -> RestoreResponse:
+    """Restore the online table to an older version after an accidental delete.
+
+    The target rows are rewritten into brand new parquet paths and the whole
+    active file set is swapped in one ``dataChange=true`` Delta commit.  The
+    operator must pass the latest version they confirmed; any append, delete
+    or compaction committed meanwhile makes the restore fail with 409 instead
+    of overwriting new observations.  Old snapshots stay readable.
+
+    Version validation (unknown versions, target newer than the confirmed
+    current version) is performed inside the Delta layer so the HTTP status
+    mapping stays identical to the rest of the API.
+    """
+    try:
+        result = delta.restore_table(
+            TABLE_DIR,
+            req.target_version,
+            req.current_version,
+        )
+    except delta.DeltaError as exc:
+        raise _delta_http(exc)
+    return RestoreResponse(
+        table=TABLE_NAME,
+        committed_version=result["version"],
+        target_version=result["target_version"],
+        confirmed_current_version=result["confirmed_current_version"],
+        files_added=result["added_files"],
+        files_removed=result["removed_files"],
+        output_file=result["output_file"],
+        rows=result["rows"],
     )
 
 
